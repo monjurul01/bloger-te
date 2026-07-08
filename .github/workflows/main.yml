@@ -2,7 +2,6 @@ name: Automated News Publisher
 
 on:
   schedule:
-    # Run every 6 hours to cycle through all categories (7 categories × 6 hours = ~42 hours for full cycle)
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
@@ -38,6 +37,7 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: ''
           
       - name: Install dependencies
         run: |
@@ -48,13 +48,14 @@ jobs:
         run: echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}' > service_account.json
           
       - name: Restore category state
-        uses: actions/cache@v3
+        uses: actions/cache/restore@v4
         with:
           path: category_state.json
-          key: category-state-${{ github.run_id }}
-          restore-keys: |
-            category-state-
-            
+          key: category-state
+          restore-keys: category-state
+          enableCrossOsArchive: true
+          fail-on-cache-miss: false
+          
       - name: Override category if specified
         if: github.event.inputs.category != ''
         run: |
@@ -68,21 +69,16 @@ jobs:
               json.dump(state, f)
           "
           
-      - name: Run news publisher
+      - name: Run Publisher Script
         run: python publish_news.py
         
       - name: Save category state
-        uses: actions/cache@v3
+        uses: actions/cache/save@v4
         if: always()
         with:
           path: category_state.json
-          key: category-state-${{ github.run_id }}
+          key: category-state
           
       - name: Cleanup credentials
         if: always()
         run: rm -f service_account.json
-        
-      - name: Report status
-        if: failure()
-        run: |
-          echo "News publishing failed. Check the logs for details."
