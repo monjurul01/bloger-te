@@ -1,50 +1,88 @@
-name: Blogger News Publisher
+name: Automated News Publisher
 
 on:
   schedule:
-    # Run every 6 hours (0:00, 6:00, 12:00, 18:00 UTC)
+    # Run every 6 hours to cycle through all categories (7 categories × 6 hours = ~42 hours for full cycle)
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       category:
-        description: 'Override category (leave empty for auto-cycle)'
+        description: 'Specific category to publish (optional)'
         required: false
         default: ''
+        type: choice
+        options:
+          - ''
+          - world
+          - politics
+          - business
+          - entertainment
+          - sports
+          - technology
+          - science
 
-permissions:
-  contents: read
+env:
+  PYTHON_VERSION: '3.11'
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
 
 jobs:
   publish-news:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+        
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-          cache: 'pip'
-
+          python-version: ${{ env.PYTHON_VERSION }}
+          
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Publisher Script
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          BLOGGER_CREDENTIALS_JSON: ${{ secrets.BLOGGER_CREDENTIALS_JSON }}
-          BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
-        run: python blogger_publisher.py
-
-      - name: Upload state artifact
-        if: always()
-        uses: actions/upload-artifact@v4
+          pip install feedparser requests google-auth google-api-python-client google-generativeai Pillow
+          
+      - name: Setup Google credentials
+        run: echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}' > service_account.json
+          
+      - name: Restore category state
+        uses: actions/cache@v3
         with:
-          name: publisher-state
-          path: publisher_state.json
-          retention-days: 30
+          path: category_state.json
+          key: category-state-${{ github.run_id }}
+          restore-keys: |
+            category-state-
+            
+      - name: Override category if specified
+        if: github.event.inputs.category != ''
+        run: |
+          python -c "
+          import json
+          categories = ['world', 'politics', 'business', 'entertainment', 'sports', 'technology', 'science']
+          category = '${{ github.event.inputs.category }}'
+          index = categories.index(category) if category in categories else -1
+          state = {'last_category_index': index - 1, 'last_run': None}
+          with open('category_state.json', 'w') as f:
+              json.dump(state, f)
+          "
+          
+      - name: Run news publisher
+        run: python publish_news.py
+        
+      - name: Save category state
+        uses: actions/cache@v3
+        if: always()
+        with:
+          path: category_state.json
+          key: category-state-${{ github.run_id }}
+          
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f service_account.json
+        
+      - name: Report status
+        if: failure()
+        run: |
+          echo "News publishing failed. Check the logs for details."
