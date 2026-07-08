@@ -64,258 +64,136 @@ jobs:
           with open('category_state.json', 'w') as f:
               json.dump(state, f)
           "
-          
+
+      - name: Create publisher script
+        run: |
+          cat > publish_news.py << 'ENDOFPYTHON'
+          import os
+          import json
+          import random
+          import base64
+          import hashlib
+          import uuid
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          import feedparser
+          import requests
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseUpload
+          import google.generativeai as genai
+          from PIL import Image
+          import io
+
+          CATEGORIES = {
+              "world": {"feeds": ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "https://www.aljazeera.com/xml/rss/all.xml"], "label": "World News"},
+              "politics": {"feeds": ["https://feeds.bbci.co.uk/news/politics/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", "https://www.politico.com/rss/politics-news.xml"], "label": "Politics"},
+              "business": {"feeds": ["https://feeds.bbci.co.uk/news/business/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "https://www.reuters.com/business/rss"], "label": "Business"},
+              "entertainment": {"feeds": ["https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml", "https://www.hollywoodreporter.com/feed/"], "label": "Entertainment"},
+              "sports": {"feeds": ["https://feeds.bbci.co.uk/sport/rss.xml", "https://www.espn.com/espn/rss/news", "https://www.skysports.com/rss/12040"], "label": "Sports"},
+              "technology": {"feeds": ["https://feeds.bbci.co.uk/news/technology/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml", "https://www.theverge.com/rss/index.xml"], "label": "Technology"},
+              "science": {"feeds": ["https://feeds.bbci.co.uk/news/science_and_environment/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml", "https://www.sciencedaily.com/rss/all.xml"], "label": "Science"}
+          }
+
+          STATE_FILE = "category_state.json"
+
+          def load_state():
+              if os.path.exists(STATE_FILE):
+                  with open(STATE_FILE, 'r') as f:
+                      return json.load(f)
+              return {"last_category_index": -1, "last_run": None}
+
+          def save_state(state):
+              with open(STATE_FILE, 'w') as f:
+                  json.dump(state, f)
+
+          def get_next_category():
+              state = load_state()
+              category_keys = list(CATEGORIES.keys())
+              next_index = (state["last_category_index"] + 1) % len(category_keys)
+              state["last_category_index"] = next_index
+              state["last_run"] = datetime.now().isoformat()
+              save_state(state)
+              return category_keys[next_index]
+
+          def fetch_news(category_key):
+              category = CATEGORIES[category_key]
+              articles = []
+              for feed_url in category["feeds"]:
+                  try:
+                      feed = feedparser.parse(feed_url)
+                      for entry in feed.entries[:10]:
+                          if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                              pub_date = datetime(*entry.published_parsed[:6])
+                          else:
+                              pub_date = datetime.now()
+                          articles.append({"title": entry.get('title', 'No Title'), "summary": entry.get('summary', entry.get('description', '')), "link": entry.get('link', ''), "published": pub_date, "source": feed_url})
+                  except Exception as e:
+                      print(f"Error fetching feed {feed_url}: {e}")
+                      continue
+              if not articles:
+                  raise Exception(f"No articles found for category: {category_key}")
+              articles.sort(key=lambda x: x["published"], reverse=True)
+              return articles[0]
+
+          def rewrite_article(title, summary, category_label):
+              genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
+              model = genai.GenerativeModel('gemini-pro')
+              prompt = f"You are a professional news writer. Rewrite this news to be 100% unique, AdSense safe, well-written. Category: {category_label}. Title: {title}. Summary: {summary}. Provide JSON with keys: headline, article, takeaways."
+              response = model.generate_content(prompt)
+              result_text = response.text
+              try:
+                  json_start = result_text.find('{')
+                  json_end = result_text.rfind('}') + 1
+                  if json_start != -1 and json_end != -1:
+                      return json.loads(result_text[json_start:json_end])
+              except json.JSONDecodeError:
+                  pass
+              return {"headline": f"{category_label}: Latest Updates", "article": result_text, "takeaways": "Stay informed with the latest news updates."}
+
+          def generate_image(headline, category_label):
+              genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
+              model = genai.GenerativeModel('gemini-pro')
+              prompt = f"Generate a professional news article image for: {headline}. Category: {category_label}. Clean modern design, professional colors, no text."
+              try:
+                  response = model.generate_content(prompt, generation_config=genai.GenerationConfig(response_modalities=["TEXT", "IMAGE"]))
+                  for part in response.parts:
+                      if hasattr(part, 'inline_data') and part.inline_data:
+                          return io.BytesIO(part.inline_data.data)
+                  return None
+              except Exception as e:
+                  print(f"Image generation failed: {e}")
+                  return None
+
+          def post_to_blogger(headline, article, takeaways, image_url, category_key):
+              credentials = service_account.Credentials.from_service_account_file('service_account.json', scopes=['https://www.googleapis.com/auth/blogger'])
+              service = build('blogger', 'v3', credentials=credentials)
+              blog_id = os.environ.get('BLOGGER_BLOG_ID')
+              takeaways_html = "<ul>" + "".join(f"<li>{t}</li>" for t in takeaways) + "</ul>" if isinstance(takeaways, list) else f"<p><strong>Key Takeaways:</strong> {takeaways}</p>"
+              img_tag = f'<img src="{image_url}" alt="{headline}" style="width:100%;border-radius:8px;margin-bottom:20px;" />' if image_url else ""
+              html_content = f'<div style="max-width:800px;margin:0 auto;font-family:Arial;">{img_tag}<div style="padding:20px;"><p style="color:#666;font-size:14px;">Published on {datetime.now().strftime("%B %d, %Y")}</p><div style="line-height:1.8;font-size:16px;">{article.replace(chr(10), "<br>")}</div><div style="margin-top:30px;padding:20px;background:#f5f5f5;border-radius:8px;"><h3 style="margin-top:0;color:#333;">Key Takeaways</h3>{takeaways_html}</div></div></div>'
+              post_body = {"kind": "blogger#post", "title": headline, "content": html_content, "labels": ["News", CATEGORIES[category_key]["label"]]}
+              post = service.posts().insert(blogId=blog_id, body=post_body).execute()
+              return post
+
+          def main():
+              print(f"Starting news publishing at {datetime.now()}")
+              current_category = get_next_category()
+              print(f"Processing category: {current_category}")
+              article = fetch_news(current_category)
+              print(f"Fetched: {article['title']}")
+              rewritten = rewrite_article(article['title'], article['summary'], CATEGORIES[current_category]['label'])
+              print(f"Rewritten headline: {rewritten['headline']}")
+              image_data = generate_image(rewritten['headline'], CATEGORIES[current_category]['label'])
+              image_url = f"https://via.placeholder.com/1200x630/0066CC/FFFFFF?text={current_category.upper()}"
+              post = post_to_blogger(rewritten['headline'], rewritten['article'], rewritten['takeaways'], image_url, current_category)
+              print(f"Successfully posted: {post.get('url', 'Done')}")
+
+          main()
+          ENDOFPYTHON
+
       - name: Run Publisher Script
-        run: python - << 'PYEOF'
-import os
-import json
-import random
-import base64
-import hashlib
-from datetime import datetime, timedelta
-from pathlib import Path
-import feedparser
-import requests
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-import google.generativeai as genai
-from PIL import Image
-import io
-
-CATEGORIES = {
-    "world": {
-        "feeds": [
-            "https://feeds.bbci.co.uk/news/world/rss.xml",
-            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-            "https://www.aljazeera.com/xml/rss/all.xml"
-        ],
-        "label": "World News"
-    },
-    "politics": {
-        "feeds": [
-            "https://feeds.bbci.co.uk/news/politics/rss.xml",
-            "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
-            "https://www.politico.com/rss/politics-news.xml"
-        ],
-        "label": "Politics"
-    },
-    "business": {
-        "feeds": [
-            "https://feeds.bbci.co.uk/news/business/rss.xml",
-            "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
-            "https://www.reuters.com/business/rss"
-        ],
-        "label": "Business"
-    },
-    "entertainment": {
-        "feeds": [
-            "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
-            "https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml",
-            "https://www.hollywoodreporter.com/feed/"
-        ],
-        "label": "Entertainment"
-    },
-    "sports": {
-        "feeds": [
-            "https://feeds.bbci.co.uk/sport/rss.xml",
-            "https://www.espn.com/espn/rss/news",
-            "https://www.skysports.com/rss/12040"
-        ],
-        "label": "Sports"
-    },
-    "technology": {
-        "feeds": [
-            "https://feeds.bbci.co.uk/news/technology/rss.xml",
-            "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
-            "https://www.theverge.com/rss/index.xml"
-        ],
-        "label": "Technology"
-    },
-    "science": {
-        "feeds": [
-            "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-            "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml",
-            "https://www.sciencedaily.com/rss/all.xml"
-        ],
-        "label": "Science"
-    }
-}
-
-STATE_FILE = "category_state.json"
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {"last_category_index": -1, "last_run": None}
-
-def save_state(state):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f)
-
-def get_next_category():
-    state = load_state()
-    category_keys = list(CATEGORIES.keys())
-    next_index = (state["last_category_index"] + 1) % len(category_keys)
-    state["last_category_index"] = next_index
-    state["last_run"] = datetime.now().isoformat()
-    save_state(state)
-    return category_keys[next_index]
-
-def fetch_news(category_key):
-    category = CATEGORIES[category_key]
-    articles = []
-    for feed_url in category["feeds"]:
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:10]:
-                if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                    pub_date = datetime(*entry.published_parsed[:6])
-                else:
-                    pub_date = datetime.now()
-                articles.append({
-                    "title": entry.get('title', 'No Title'),
-                    "summary": entry.get('summary', entry.get('description', '')),
-                    "link": entry.get('link', ''),
-                    "published": pub_date,
-                    "source": feed_url
-                })
-        except Exception as e:
-            print(f"Error fetching feed {feed_url}: {e}")
-            continue
-    if not articles:
-        raise Exception(f"No articles found for category: {category_key}")
-    articles.sort(key=lambda x: x["published"], reverse=True)
-    return articles[0]
-
-def rewrite_article(title, summary, category_label):
-    genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-    model = genai.GenerativeModel('gemini-pro')
-    prompt = f"""You are a professional news writer. Rewrite the following news article to be:
-    - 100% unique and original
-    - Safe for Google AdSense (no controversial, explicit, or misleading content)
-    - Well-written with proper grammar and structure
-    - Engaging and informative
-    - Factual and accurate
-    Category: {category_label}
-    Original Title: {title}
-    Original Summary: {summary}
-    Please provide:
-    1. A compelling new headline
-    2. A well-written article (300-500 words)
-    3. Key takeaways or bullet points
-    Format the response as JSON with keys: "headline", "article", "takeaways"
-    """
-    response = model.generate_content(prompt)
-    result_text = response.text
-    try:
-        json_start = result_text.find('{')
-        json_end = result_text.rfind('}') + 1
-        if json_start != -1 and json_end != -1:
-            return json.loads(result_text[json_start:json_end])
-    except json.JSONDecodeError:
-        pass
-    return {
-        "headline": f"{category_label}: Latest Updates",
-        "article": result_text,
-        "takeaways": "Stay informed with the latest news updates."
-    }
-
-def generate_image(headline, category_label):
-    genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-    model = genai.GenerativeModel('gemini-pro')
-    prompt = f"""Generate a professional, visually appealing news article image for:
-    Headline: {headline}
-    Category: {category_label}
-    Requirements:
-    - Clean, modern design suitable for a news website
-    - Professional color scheme
-    - Abstract or symbolic representation of the news topic
-    - No text overlays
-    - High quality and sharp details
-    Generate an image that would work well as a featured image for a news article."""
-    try:
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(response_modalities=["TEXT", "IMAGE"])
-        )
-        for part in response.parts:
-            if hasattr(part, 'inline_data') and part.inline_data:
-                image_data = part.inline_data.data
-                return io.BytesIO(image_data)
-        return None
-    except Exception as e:
-        print(f"Image generation failed: {e}")
-        return None
-
-def post_to_blogger(headline, article, takeaways, image_url, category_key):
-    credentials = service_account.Credentials.from_service_account_file(
-        'service_account.json',
-        scopes=['https://www.googleapis.com/auth/blogger']
-    )
-    service = build('blogger', 'v3', credentials=credentials)
-    blog_id = os.environ.get('BLOGGER_BLOG_ID')
-    takeaways_html = ""
-    if isinstance(takeaways, list):
-        takeaways_html = "<ul>" + "".join(f"<li>{t}</li>" for t in takeaways) + "</ul>"
-    else:
-        takeaways_html = f"<p><strong>Key Takeaways:</strong> {takeaways}</p>"
-    img_tag = f'<img src="{image_url}" alt="{headline}" style="width: 100%; height: auto; border-radius: 8px; margin-bottom: 20px;" />' if image_url else ""
-    html_content = f"""
-    <div style="max-width: 800px; margin: 0 auto; font-family: Arial, sans-serif;">
-        {img_tag}
-        <div style="padding: 20px;">
-            <p style="color: #666; font-size: 14px; margin-bottom: 10px;">
-                Published on {datetime.now().strftime('%B %d, %Y')}
-            </p>
-            <div style="line-height: 1.8; font-size: 16px;">
-                {article.replace(chr(10), '<br>')}
-            </div>
-            <div style="margin-top: 30px; padding: 20px; background: #f5f5f5; border-radius: 8px;">
-                <h3 style="margin-top: 0; color: #333;">Key Takeaways</h3>
-                {takeaways_html}
-            </div>
-        </div>
-    </div>
-    """
-    post_body = {
-        "kind": "blogger#post",
-        "title": headline,
-        "content": html_content,
-        "labels": ["News", CATEGORIES[category_key]["label"]]
-    }
-    post = service.posts().insert(blogId=blog_id, body=post_body).execute()
-    return post
-
-def main():
-    print(f"Starting news publishing at {datetime.now()}")
-    try:
-        current_category = get_next_category()
-        print(f"Processing category: {current_category}")
-        print("Fetching news article...")
-        article = fetch_news(current_category)
-        print(f"Fetched: {article['title']}")
-        print("Rewriting article with Gemini...")
-        rewritten = rewrite_article(article['title'], article['summary'], CATEGORIES[current_category]['label'])
-        print(f"Rewritten headline: {rewritten['headline']}")
-        print("Generating image...")
-        image_data = generate_image(rewritten['headline'], CATEGORIES[current_category]['label'])
-        image_url = "https://via.placeholder.com/1200x630/0066CC/FFFFFF?text=News"
-        if image_data:
-            import uuid
-            filename = f"news_{uuid.uuid4().hex[:8]}.png"
-            image_url = f"https://via.placeholder.com/1200x630/0066CC/FFFFFF?text={current_category.upper()}"
-        print("Posting to Blogger...")
-        post = post_to_blogger(rewritten['headline'], rewritten['article'], rewritten['takeaways'], image_url, current_category)
-        print(f"Successfully posted: {post.get('url', 'No URL available')}")
-        print("News publishing completed successfully!")
-    except Exception as e:
-        print(f"Error during publishing: {e}")
-        raise
-
-main()
-PYEOF
+        run: python publish_news.py
         
       - name: Save category state
         uses: actions/cache/save@v4
@@ -326,4 +204,4 @@ PYEOF
           
       - name: Cleanup credentials
         if: always()
-        run: rm -f service_account.json
+        run: rm -f service_account.json publish_news.py
