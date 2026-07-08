@@ -42,7 +42,18 @@ jobs:
           pip install feedparser requests google-auth google-api-python-client
           
       - name: Setup Google credentials
-        run: echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}' > service_account.json
+        run: python -c "
+import json, os
+key_data = os.environ['GOOGLE_SERVICE_ACCOUNT_KEY']
+key_dict = json.loads(key_data)
+if 'private_key' in key_dict:
+    key_dict['private_key'] = key_dict['private_key'].replace('\\\\n', '\n').replace('\\n', '\n')
+with open('service_account.json', 'w') as f:
+    json.dump(key_dict, f, indent=2)
+print('Service account file created successfully')
+"
+        env:
+          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
           
       - name: Restore category state
         uses: actions/cache/restore@v4
