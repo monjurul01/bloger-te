@@ -39,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install feedparser requests google-auth google-api-python-client google-generativeai Pillow
+          pip install feedparser requests google-auth google-api-python-client
           
       - name: Setup Google credentials
         run: echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}' > service_account.json
@@ -65,107 +65,107 @@ jobs:
               json.dump(state, f)
           "
 
-      - name: Create publisher script
+      - name: Create and run publisher
+        shell: python
         run: |
-          cat > publish_news.py << 'ENDOFPYTHON'
-import os
-import json
-import requests
-from datetime import datetime
-import feedparser
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+          import os, json, base64, requests
+          from datetime import datetime
+          import feedparser
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
 
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-BLOGGER_BLOG_ID = os.environ.get('BLOGGER_BLOG_ID')
+          GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+          BLOGGER_BLOG_ID = os.environ.get('BLOGGER_BLOG_ID')
 
-CATEGORIES = {
-    "world": {"feeds": ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "https://www.aljazeera.com/xml/rss/all.xml"], "label": "World News"},
-    "politics": {"feeds": ["https://feeds.bbci.co.uk/news/politics/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", "https://www.politico.com/rss/politics-news.xml"], "label": "Politics"},
-    "business": {"feeds": ["https://feeds.bbci.co.uk/news/business/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "https://www.reuters.com/business/rss"], "label": "Business"},
-    "entertainment": {"feeds": ["https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml", "https://www.hollywoodreporter.com/feed/"], "label": "Entertainment"},
-    "sports": {"feeds": ["https://feeds.bbci.co.uk/sport/rss.xml", "https://www.espn.com/espn/rss/news", "https://www.skysports.com/rss/12040"], "label": "Sports"},
-    "technology": {"feeds": ["https://feeds.bbci.co.uk/news/technology/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml", "https://www.theverge.com/rss/index.xml"], "label": "Technology"},
-    "science": {"feeds": ["https://feeds.bbci.co.uk/news/science_and_environment/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml", "https://www.sciencedaily.com/rss/all.xml"], "label": "Science"}
-}
+          CATEGORIES = {
+              "world": {"feeds": ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "https://www.aljazeera.com/xml/rss/all.xml"], "label": "World News"},
+              "politics": {"feeds": ["https://feeds.bbci.co.uk/news/politics/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", "https://www.politico.com/rss/politics-news.xml"], "label": "Politics"},
+              "business": {"feeds": ["https://feeds.bbci.co.uk/news/business/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "https://www.reuters.com/business/rss"], "label": "Business"},
+              "entertainment": {"feeds": ["https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml", "https://www.hollywoodreporter.com/feed/"], "label": "Entertainment"},
+              "sports": {"feeds": ["https://feeds.bbci.co.uk/sport/rss.xml", "https://www.espn.com/espn/rss/news", "https://www.skysports.com/rss/12040"], "label": "Sports"},
+              "technology": {"feeds": ["https://feeds.bbci.co.uk/news/technology/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml", "https://www.theverge.com/rss/index.xml"], "label": "Technology"},
+              "science": {"feeds": ["https://feeds.bbci.co.uk/news/science_and_environment/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml", "https://www.sciencedaily.com/rss/all.xml"], "label": "Science"}
+          }
 
-def load_state():
-    if os.path.exists("category_state.json"):
-        with open("category_state.json", "r") as f:
-            return json.load(f)
-    return {"last_category_index": -1}
+          def load_state():
+              if os.path.exists("category_state.json"):
+                  with open("category_state.json", "r") as f:
+                      return json.load(f)
+              return {"last_category_index": -1}
 
-def save_state(state):
-    with open("category_state.json", "w") as f:
-        json.dump(state, f)
+          def save_state(state):
+              with open("category_state.json", "w") as f:
+                  json.dump(state, f)
 
-def get_next_category():
-    state = load_state()
-    keys = list(CATEGORIES.keys())
-    idx = (state["last_category_index"] + 1) % len(keys)
-    state["last_category_index"] = idx
-    state["last_run"] = datetime.now().isoformat()
-    save_state(state)
-    return keys[idx]
+          def get_next_category():
+              state = load_state()
+              keys = list(CATEGORIES.keys())
+              idx = (state["last_category_index"] + 1) % len(keys)
+              state["last_category_index"] = idx
+              state["last_run"] = datetime.now().isoformat()
+              save_state(state)
+              return keys[idx]
 
-def fetch_news(category_key):
-    feeds = CATEGORIES[category_key]["feeds"]
-    articles = []
-    for url in feeds:
-        try:
-            feed = feedparser.parse(url)
-            for e in feed.entries[:10]:
-                articles.append({"title": e.get("title",""), "summary": e.get("summary",""), "link": e.get("link","")})
-        except:
-            continue
-    if not articles:
-        raise Exception("No articles found")
-    return articles[0]
+          def fetch_news(category_key):
+              feeds = CATEGORIES[category_key]["feeds"]
+              articles = []
+              for url in feeds:
+                  try:
+                      feed = feedparser.parse(url)
+                      for e in feed.entries[:10]:
+                          articles.append({"title": e.get("title",""), "summary": e.get("summary",""), "link": e.get("link","")})
+                  except:
+                      continue
+              if not articles:
+                  raise Exception("No articles found")
+              return articles[0]
 
-def call_gemini(prompt):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+          def call_gemini(prompt):
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+              payload = {"contents": [{"parts": [{"text": prompt}]}]}
+              r = requests.post(url, json=payload, timeout=60)
+              r.raise_for_status()
+              return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
-def rewrite_article(title, summary, category_label):
-    prompt = f"Rewrite this news for a blog. Be unique, professional, AdSense safe. Return JSON: {{\"headline\":\"...\",\"article\":\"...\",\"takeaways\":\"...\"}} Category: {category_label} Title: {title} Summary: {summary}"
-    try:
-        text = call_gemini(prompt)
-        s = text.find("{")
-        e = text.rfind("}") + 1
-        if s != -1 and e != -1:
-            return json.loads(text[s:e])
-    except:
-        pass
-    return {"headline": title, "article": summary, "takeaways": "Read more."}
+          def rewrite_article(title, summary, category_label):
+              prompt = f"Rewrite this news for a blog. Be unique, professional, AdSense safe. Return JSON with keys headline, article, takeaways. Category: {category_label} Title: {title} Summary: {summary}"
+              try:
+                  text = call_gemini(prompt)
+                  s = text.find("{")
+                  e = text.rfind("}") + 1
+                  if s != -1 and e != -1:
+                      return json.loads(text[s:e])
+              except:
+                  pass
+              return {"headline": title, "article": summary, "takeaways": "Read more."}
 
-def post_to_blogger(headline, article, takeaways, category_key):
-    creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=["https://www.googleapis.com/auth/blogger"])
-    service = build("blogger", "v3", credentials=creds)
-    th = f"<ul>{''.join(f'<li>{t}</li>' for t in takeaways)}</ul>" if isinstance(takeaways, list) else f"<p>{takeaways}</p>"
-    html = f'<div style="max-width:800px;margin:0 auto;font-family:Arial;"><p style="color:#666;">Published {datetime.now().strftime("%B %d, %Y")}</p><div style="line-height:1.8;">{article.replace(chr(10),"<br>")}</div><div style="margin-top:20px;padding:15px;background:#f5f5f5;border-radius:8px;"><h3>Key Takeaways</h3>{th}</div></div>'
-    body = {"kind":"blogger#post","title":headline,"content":html,"labels":["News",CATEGORIES[category_key]["label"]]}
-    return service.posts().insert(blogId=BLOGGER_BLOG_ID, body=body).execute()
+          def post_to_blogger(headline, article, takeaways, category_key):
+              creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=["https://www.googleapis.com/auth/blogger"])
+              service = build("blogger", "v3", credentials=creds)
+              if isinstance(takeaways, list):
+                  th = "<ul>" + "".join(f"<li>{t}</li>" for t in takeaways) + "</ul>"
+              else:
+                  th = "<p>" + str(takeaways) + "</p>"
+              date_str = datetime.now().strftime("%B %d, %Y")
+              art_html = article.replace("\n", "<br>")
+              html = '<div style="max-width:800px;margin:0 auto;font-family:Arial;">'
+              html += '<p style="color:#666;">Published ' + date_str + '</p>'
+              html += '<div style="line-height:1.8;">' + art_html + '</div>'
+              html += '<div style="margin-top:20px;padding:15px;background:#f5f5f5;border-radius:8px;">'
+              html += '<h3>Key Takeaways</h3>' + th + '</div></div>'
+              body = {"kind": "blogger#post", "title": headline, "content": html, "labels": ["News", CATEGORIES[category_key]["label"]]}
+              return service.posts().insert(blogId=BLOGGER_BLOG_ID, body=body).execute()
 
-def main():
-    print(f"Starting at {datetime.now()}")
-    cat = get_next_category()
-    print(f"Category: {cat}")
-    art = fetch_news(cat)
-    print(f"Fetched: {art['title']}")
-    rw = rewrite_article(art["title"], art["summary"], CATEGORIES[cat]["label"])
-    print(f"Headline: {rw['headline']}")
-    post = post_to_blogger(rw["headline"], rw["article"], rw["takeaways"], cat)
-    print(f"Posted: {post.get('url','Done')}")
+          print(f"Starting at {datetime.now()}")
+          cat = get_next_category()
+          print(f"Category: {cat}")
+          art = fetch_news(cat)
+          print(f"Fetched: {art['title']}")
+          rw = rewrite_article(art["title"], art["summary"], CATEGORIES[cat]["label"])
+          print(f"Headline: {rw['headline']}")
+          post = post_to_blogger(rw["headline"], rw["article"], rw["takeaways"], cat)
+          print(f"Posted: {post.get('url', 'Done')}")
 
-main()
-ENDOFPYTHON
-
-      - name: Run Publisher Script
-        run: python publish_news.py
-        
       - name: Save category state
         uses: actions/cache/save@v4
         if: always()
@@ -175,4 +175,4 @@ ENDOFPYTHON
           
       - name: Cleanup credentials
         if: always()
-        run: rm -f service_account.json publish_news.py
+        run: rm -f service_account.json
