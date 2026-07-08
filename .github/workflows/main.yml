@@ -138,7 +138,7 @@ jobs:
 
           def rewrite_article(title, summary, category_label):
               genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-              model = genai.GenerativeModel('gemini-pro')
+              model = genai.GenerativeModel('gemini-1.5-flash')
               prompt = f"You are a professional news writer. Rewrite this news to be 100% unique, AdSense safe, well-written. Category: {category_label}. Title: {title}. Summary: {summary}. Provide JSON with keys: headline, article, takeaways."
               response = model.generate_content(prompt)
               result_text = response.text
@@ -153,7 +153,7 @@ jobs:
 
           def generate_image(headline, category_label):
               genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-              model = genai.GenerativeModel('gemini-pro')
+              model = genai.GenerativeModel('gemini-1.5-flash')
               prompt = f"Generate a professional news article image for: {headline}. Category: {category_label}. Clean modern design, professional colors, no text."
               try:
                   response = model.generate_content(prompt, generation_config=genai.GenerationConfig(response_modalities=["TEXT", "IMAGE"]))
