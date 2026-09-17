@@ -1,189 +1,725 @@
-name: Automated News Publisher
+name: Pond5 Safe Automation (FTP + Apply CSV)
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
-      category:
-        description: 'Specific category to publish (optional)'
+      pond5_username:
+        description: "Pond5 username or email"
+        required: true
+      pond5_password:
+        description: "Pond5 password"
+        required: true
+      max_uploads:
+        description: "How many files to upload in this run"
         required: false
-        default: ''
+        default: "3"
+      dry_run:
+        description: "Dry run? Uploads over FTP + only LISTS matches, writes no metadata"
+        required: true
+        default: "false"
         type: choice
         options:
-          - ''
-          - world
-          - politics
-          - business
-          - entertainment
-          - sports
-          - technology
-          - science
-
-env:
-  PYTHON_VERSION: '3.11'
-  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-  BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
+          - "false"
+          - "true"
+      sound_type:
+        description: "Default type of sound when the queue item has none"
+        required: true
+        default: "sfx"
+        type: choice
+        options:
+          - sfx
+          - music
+      price:
+        description: "Default price in USD when the queue item has none"
+        required: false
+        default: "3"
+      headless:
+        description: "Run headless? true/false"
+        required: false
+        default: "true"
+      force_run:
+        description: "Skip random time gate and upload immediately? true/false"
+        required: false
+        default: "false"
 
 jobs:
-  publish-news:
+  gate:
     runs-on: ubuntu-latest
-    
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: ''
-          
-      - name: Install dependencies
+      - name: Random time slot gate (daily-changing random upload time)
+        id: decide
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install feedparser requests google-auth google-api-python-client
-          
-      - name: Setup Google credentials
-        run: python -c "
-import json, os
-key_data = os.environ['GOOGLE_SERVICE_ACCOUNT_KEY']
-key_dict = json.loads(key_data)
-if 'private_key' in key_dict:
-    key_dict['private_key'] = key_dict['private_key'].replace('\\\\n', '\n').replace('\\n', '\n')
-with open('service_account.json', 'w') as f:
-    json.dump(key_dict, f, indent=2)
-print('Service account file created successfully')
-"
+          if [ "${{ inputs.force_run }}" = "true" ]; then
+            echo "go=yes" >> "$GITHUB_OUTPUT"
+            echo "Force run enabled - skipping random gate."
+            exit 0
+          fi
+          node -e "
+            const WINDOWS = [9, 14, 19];            // window start hours (Asia/Dhaka)
+            const WINDOW_HOURS = 3;                 // each window lasts 3 hours
+            const SLOT_MIN = 30;                    // scheduler triggers every 30 min
+            const now = new Date(Date.now() + 6 * 3600 * 1000); // UTC+6 Dhaka
+            const h = now.getUTCHours(), m = now.getUTCMinutes();
+            const dateKey = now.toISOString().slice(0, 10);
+            const wIdx = WINDOWS.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
+            if (wIdx < 0) { console.log('Outside upload windows - skip.'); process.exit(2); }
+            const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
+            const minsIn = (h - WINDOWS[wIdx]) * 60 + m;
+            const curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
+            let hash = 0;
+            const seed = dateKey + '#' + wIdx + '#POND5';
+            for (const c of seed) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+            const chosen = hash % slotsPerWindow;
+            console.log('Date ' + dateKey + ' | window ' + wIdx + ' | chosen slot ' + chosen + ' | current slot ' + curSlot);
+            process.exit(curSlot === chosen ? 0 : 2);
+          " && echo "go=yes" >> "$GITHUB_OUTPUT" || echo "go=no" >> "$GITHUB_OUTPUT"
+
+  automation:
+    needs: gate
+    if: needs.gate.outputs.go == 'yes'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Random minute-level delay (human-like timing)
+        if: inputs.force_run != 'true'
+        shell: bash
+        run: |
+          DELAY=$((RANDOM % 840))
+          echo "Sleeping extra ${DELAY}s for human-like random timing..."
+          sleep $DELAY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Connect Proton VPN (WireGuard) - optional
+        if: env.VPN_CONFIG != ''
         env:
-          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
-          
-      - name: Restore category state
-        uses: actions/cache/restore@v4
-        with:
-          path: category_state.json
-          key: category-state
-          restore-keys: category-state
-          fail-on-cache-miss: false
-          
-      - name: Override category if specified
-        if: github.event.inputs.category != ''
+          VPN_CONFIG: ${{ secrets.VPN_CONFIG }}
         run: |
-          python -c "
-          import json
-          categories = ['world', 'politics', 'business', 'entertainment', 'sports', 'technology', 'science']
-          category = '${{ github.event.inputs.category }}'
-          index = categories.index(category) if category in categories else -1
-          state = {'last_category_index': index - 1, 'last_run': None}
-          with open('category_state.json', 'w') as f:
-              json.dump(state, f)
-          "
+          set -e
+          echo "VPN_CONFIG secret found - bringing up the WireGuard tunnel."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools openresolv >/dev/null
+          printf '%s\n' "$VPN_CONFIG" | sudo tee /etc/wireguard/proton.conf >/dev/null
+          sudo chmod 600 /etc/wireguard/proton.conf
+          grep -q '\[Interface\]' /etc/wireguard/proton.conf || { echo "VPN_CONFIG is not a valid WireGuard config ([Interface] missing)."; exit 1; }
+          grep -q '\[Peer\]' /etc/wireguard/proton.conf || { echo "VPN_CONFIG is not a valid WireGuard config ([Peer] missing)."; exit 1; }
+          sudo wg-quick up proton
+          echo "--- tunnel status ---"
+          sudo wg show || true
+          echo "--- public IP ---"
+          curl -s --max-time 20 https://ipinfo.io/json || true
+          echo "VPN CONNECTED OK"
 
-      - name: Create and run publisher
-        shell: python
+      - name: Show public IP (no VPN)
+        if: env.VPN_CONFIG == ''
+        env:
+          VPN_CONFIG: ${{ secrets.VPN_CONFIG }}
         run: |
-          import os, json, base64, requests
-          from datetime import datetime
-          import feedparser
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
+          echo "No VPN_CONFIG secret - running on the GitHub runner IP."
+          curl -s --max-time 20 https://ipinfo.io/json || true
 
-          GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-          BLOGGER_BLOG_ID = os.environ.get('BLOGGER_BLOG_ID')
+      - name: Create bot.js
+        run: |
+          cat > bot.js <<'POND5_BOT_EOF'
+          const { chromium } = require("playwright");
+          const fs = require("fs");
+          const path = require("path");
+          const { execFileSync } = require("child_process");
 
-          CATEGORIES = {
-              "world": {"feeds": ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "https://www.aljazeera.com/xml/rss/all.xml"], "label": "World News"},
-              "politics": {"feeds": ["https://feeds.bbci.co.uk/news/politics/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", "https://www.politico.com/rss/politics-news.xml"], "label": "Politics"},
-              "business": {"feeds": ["https://feeds.bbci.co.uk/news/business/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "https://www.reuters.com/business/rss"], "label": "Business"},
-              "entertainment": {"feeds": ["https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml", "https://www.hollywoodreporter.com/feed/"], "label": "Entertainment"},
-              "sports": {"feeds": ["https://feeds.bbci.co.uk/sport/rss.xml", "https://www.espn.com/espn/rss/news", "https://www.skysports.com/rss/12040"], "label": "Sports"},
-              "technology": {"feeds": ["https://feeds.bbci.co.uk/news/technology/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml", "https://www.theverge.com/rss/index.xml"], "label": "Technology"},
-              "science": {"feeds": ["https://feeds.bbci.co.uk/news/science_and_environment/rss.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml", "https://www.sciencedaily.com/rss/all.xml"], "label": "Science"}
+          // ===========================================================================
+          // CONFIG
+          // ===========================================================================
+          const firebaseDatabaseURL = "https://zedge-r2-edward-hermes-default-rtdb.firebaseio.com"; // <-- CONFIG: Firebase Realtime DB
+          const queuePath = process.env.QUEUE_PATH || "pond5Queue";                                  // <-- CONFIG: queue node
+          const r2WorkerUrl = "https://proud-paper-6fd7.monjurulgd2001.workers.dev";                 // <-- CONFIG: Cloudflare R2 worker
+
+          const FTP_HOST = process.env.POND5_FTP_HOST || "ftp.pond5.com";
+          const FTP_USER = process.env.POND5_FTP_USER || process.env.POND5_USERNAME || "";
+          const FTP_PASS = process.env.POND5_FTP_PASS || "";
+
+          const USERNAME = process.env.POND5_USERNAME || "";
+          const PASSWORD = process.env.POND5_PASSWORD || "";
+          const MAX_UPLOADS = Math.max(1, parseInt(process.env.MAX_UPLOADS || "3", 10) || 3);
+          const HEADLESS = process.env.HEADLESS !== "false";
+          const DRY_RUN = process.env.DRY_RUN === "true";
+          const INGEST_WAIT_MIN = Math.max(1, parseInt(process.env.INGEST_WAIT_MIN || "10", 10) || 10);
+          const RUN_LABEL = process.env.FOLDER_NAME || "Pond5";
+
+          // Defaults used whenever the queue item does not carry its own value.
+          const DEF = {
+            soundType: process.env.DEFAULT_SOUND_TYPE || "sfx",   // sfx | music
+            price: process.env.DEFAULT_PRICE || "3",
+            copyright: process.env.DEFAULT_COPYRIGHT || "Md Monjurul Islam",
+            publisher: process.env.DEFAULT_PUBLISHER || "Md. Monjurul Islam",
+            composer: process.env.DEFAULT_COMPOSER || "Md. Monjurul Islam",
+            clipSource: "other"
+          };
+
+          const LOGIN_URL = "https://www.pond5.com/index.php?page=login";
+          const APPLY_CSV_URL = "https://www.pond5.com/index.php?page=apply_csv";
+          const MY_UPLOADS_URL = "https://www.pond5.com/index.php?page=my_uploads";
+
+          if (!USERNAME) throw new Error("POND5_USERNAME is required");
+          if (!PASSWORD) throw new Error("POND5_PASSWORD is required");
+          if (!FTP_PASS) throw new Error("POND5_FTP_PASS secret is required (the FTP password you set on the upload page)");
+
+          const localDir = path.join(process.cwd(), "pond5-files");
+          fs.mkdirSync(localDir, { recursive: true });
+
+          // ===========================================================================
+          // Firebase helpers
+          // ===========================================================================
+          async function firebaseGet(p) {
+            const res = await fetch(`${firebaseDatabaseURL}/${p}.json`);
+            if (!res.ok) throw new Error(`Firebase GET failed: ${res.status}`);
+            return await res.json();
+          }
+          async function firebasePatch(p, data) {
+            const res = await fetch(`${firebaseDatabaseURL}/${p}.json`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(data)
+            });
+            if (!res.ok) throw new Error(`Firebase PATCH failed: ${res.status}`);
+            return await res.json();
+          }
+          async function firebaseDelete(p) {
+            const res = await fetch(`${firebaseDatabaseURL}/${p}.json`, { method: "DELETE" });
+            if (!res.ok) throw new Error(`Firebase DELETE failed: ${res.status}`);
+            console.log(`Deleted from Firebase: ${p}`);
           }
 
-          def load_state():
-              if os.path.exists("category_state.json"):
-                  with open("category_state.json", "r") as f:
-                      return json.load(f)
-              return {"last_category_index": -1}
+          // ===========================================================================
+          // Telegram helpers (same style as the Zedge bot)
+          // ===========================================================================
+          function tgEscape(s) {
+            return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          }
+          function fmtDhakaTime(d = new Date()) {
+            try {
+              return d.toLocaleString("en-GB", { timeZone: "Asia/Dhaka", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }).replace(",", " ·");
+            } catch (_) { return d.toISOString(); }
+          }
+          function fmtDuration(ms) {
+            const s = Math.max(0, Math.round(ms / 1000));
+            const m = Math.floor(s / 60), r = s % 60;
+            return m ? `${m} মিনিট ${r} সেকেন্ড` : `${r} সেকেন্ড`;
+          }
+          function fmtBytes(n) {
+            return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+          }
+          function greetBn() {
+            const h = new Date(Date.now() + 6 * 3600 * 1000).getUTCHours();
+            if (h < 6) return "শুভ রাত";
+            if (h < 12) return "শুভ সকাল";
+            if (h < 17) return "শুভ দুপুর";
+            if (h < 20) return "শুভ সন্ধ্যা";
+            return "শুভ রাত";
+          }
+          const tgCard = (header, rows, footer) => {
+            const body = rows.filter(r => r && r[1] !== undefined && r[1] !== null && r[1] !== "")
+              .map(([k, v]) => `${k} ${v}`).join("\n");
+            return [header, "━━━━━━━━━━━━━━━━", body, footer ? `\n${footer}` : ""].filter(Boolean).join("\n");
+          };
+          async function sendTelegram(message) {
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId) { console.log("Telegram not configured - skipping notification."); return; }
+            try {
+              const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" })
+              });
+              if (!res.ok) console.log(`Telegram failed: HTTP ${res.status} - ${await res.text().catch(() => "")}`);
+              else console.log("Telegram notification sent.");
+            } catch (e) {
+              console.log(`Telegram error: ${e.message}`);
+            }
+          }
+          async function sendTelegramPhoto(filePath, caption) {
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId || !filePath || !fs.existsSync(filePath)) return;
+            try {
+              const form = new FormData();
+              form.append("chat_id", chatId);
+              if (caption) { form.append("caption", caption.slice(0, 1000)); form.append("parse_mode", "HTML"); }
+              form.append("photo", new Blob([fs.readFileSync(filePath)]), path.basename(filePath));
+              const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: "POST", body: form });
+              if (!res.ok) console.log(`Telegram photo failed: HTTP ${res.status}`);
+            } catch (e) {
+              console.log(`Telegram photo error: ${e.message}`);
+            }
+          }
 
-          def save_state(state):
-              with open("category_state.json", "w") as f:
-                  json.dump(state, f)
+          // ===========================================================================
+          // Queue: claim up to MAX_UPLOADS items
+          // ===========================================================================
+          function sanitizeFileName(name) {
+            // Pond5 matches on the exact filename, so keep it simple and ASCII-safe.
+            return String(name || "")
+              .replace(/[^\w.\-]+/g, "-")
+              .replace(/-+/g, "-")
+              .replace(/^-|-$/g, "")
+              .slice(0, 120);
+          }
 
-          def get_next_category():
-              state = load_state()
-              keys = list(CATEGORIES.keys())
-              idx = (state["last_category_index"] + 1) % len(keys)
-              state["last_category_index"] = idx
-              state["last_run"] = datetime.now().isoformat()
-              save_state(state)
-              return keys[idx]
+          async function claimQueueItems(limit) {
+            const all = await firebaseGet(queuePath);
+            if (!all || typeof all !== "object") return [];
 
-          def fetch_news(category_key):
-              feeds = CATEGORIES[category_key]["feeds"]
-              articles = []
-              for url in feeds:
-                  try:
-                      feed = feedparser.parse(url)
-                      for e in feed.entries[:10]:
-                          articles.append({"title": e.get("title",""), "summary": e.get("summary",""), "link": e.get("link","")})
-                  except:
-                      continue
-              if not articles:
-                  raise Exception("No articles found")
-              return articles[0]
+            const pending = Object.entries(all)
+              .filter(([, v]) => v && typeof v === "object")
+              .filter(([, v]) => !v.status || v.status === "queued")
+              .filter(([, v]) => v.fileUrl)
+              .sort((a, b) => (a[1].queuedAt || a[1].createdAt || 0) - (b[1].queuedAt || b[1].createdAt || 0));
 
-          def call_gemini(prompt):
-              url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-              payload = {"contents": [{"parts": [{"text": prompt}]}]}
-              r = requests.post(url, json=payload, timeout=60)
-              r.raise_for_status()
-              return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            console.log(`Queue: ${Object.keys(all).length} total, ${pending.length} ready to upload`);
 
-          def rewrite_article(title, summary, category_label):
-              prompt = f"Rewrite this news for a blog. Be unique, professional, AdSense safe. Return JSON with keys headline, article, takeaways. Category: {category_label} Title: {title} Summary: {summary}"
-              try:
-                  text = call_gemini(prompt)
-                  s = text.find("{")
-                  e = text.rfind("}") + 1
-                  if s != -1 and e != -1:
-                      return json.loads(text[s:e])
-              except:
-                  pass
-              return {"headline": title, "article": summary, "takeaways": "Read more."}
+            const claimed = [];
+            for (const [id, item] of pending) {
+              if (claimed.length >= limit) break;
 
-          def post_to_blogger(headline, article, takeaways, category_key):
-              creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=["https://www.googleapis.com/auth/blogger"])
-              service = build("blogger", "v3", credentials=creds)
-              if isinstance(takeaways, list):
-                  th = "<ul>" + "".join(f"<li>{t}</li>" for t in takeaways) + "</ul>"
-              else:
-                  th = "<p>" + str(takeaways) + "</p>"
-              date_str = datetime.now().strftime("%B %d, %Y")
-              art_html = article.replace("\n", "<br>")
-              html = '<div style="max-width:800px;margin:0 auto;font-family:Arial;">'
-              html += '<p style="color:#666;">Published ' + date_str + '</p>'
-              html += '<div style="line-height:1.8;">' + art_html + '</div>'
-              html += '<div style="margin-top:20px;padding:15px;background:#f5f5f5;border-radius:8px;">'
-              html += '<h3>Key Takeaways</h3>' + th + '</div></div>'
-              body = {"kind": "blogger#post", "title": headline, "content": html, "labels": ["News", CATEGORIES[category_key]["label"]]}
-              return service.posts().insert(blogId=BLOGGER_BLOG_ID, body=body).execute()
+              // ANTI DOUBLE-UPLOAD GUARD: claim with a unique token, then verify ownership.
+              const claimToken = `claim-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+              await firebasePatch(`${queuePath}/${id}`, { status: "processing", processingAt: Date.now(), claimToken });
+              const check = await firebaseGet(`${queuePath}/${id}`);
+              if (!check || check.claimToken !== claimToken) {
+                console.warn(`Item ${id} claimed by another run - skipping.`);
+                continue;
+              }
 
-          print(f"Starting at {datetime.now()}")
-          cat = get_next_category()
-          print(f"Category: {cat}")
-          art = fetch_news(cat)
-          print(f"Fetched: {art['title']}")
-          rw = rewrite_article(art["title"], art["summary"], CATEGORIES[cat]["label"])
-          print(f"Headline: {rw['headline']}")
-          post = post_to_blogger(rw["headline"], rw["article"], rw["takeaways"], cat)
-          print(f"Posted: {post.get('url', 'Done')}")
+              const rawName = item.name || `${id}.wav`;
+              const ext = (path.extname(rawName) || ".wav").toLowerCase();
+              const base = sanitizeFileName(path.basename(rawName, path.extname(rawName))) || id;
+              const remoteName = `${base}${ext}`;
 
-      - name: Save category state
-        uses: actions/cache/save@v4
+              claimed.push({
+                id,
+                remoteName,
+                localFile: path.join(localDir, remoteName),
+                fileUrl: item.fileUrl,
+                title: item.title || base.replace(/[-_]+/g, " ").trim(),
+                description: item.description || "",
+                keywords: item.tags || item.keywords || "",
+                keywordsCheckbox: item.keywordsCheckbox || "",
+                soundType: item.soundType || DEF.soundType,
+                price: item.price != null && item.price !== "" ? String(item.price) : DEF.price,
+                city: item.city || "",
+                region: item.region || "",
+                country: item.country || "",
+                specifySource: item.specifySource || "",
+                created: item.created || "",
+                publisher: item.publisher || DEF.publisher,
+                composer: item.composer || DEF.composer,
+                copyright: item.copyright || DEF.copyright
+              });
+            }
+            return claimed;
+          }
+
+          async function markDoneAndDelete(item) {
+            await firebaseDelete(`${queuePath}/${item.id}`);
+            let fileKey = "";
+            try {
+              fileKey = decodeURIComponent(new URL(item.fileUrl).pathname.replace(/^\/+/, ""));
+            } catch {
+              fileKey = String(item.fileUrl).replace(/^https?:\/\/[^/]+\//i, "");
+            }
+            try {
+              const res = await fetch(r2WorkerUrl, { method: "DELETE", headers: { "X-File-Name": fileKey } });
+              console.log(`R2 delete "${fileKey}" -> HTTP ${res.status}`);
+            } catch (e) {
+              console.error(`R2 delete failed for "${fileKey}": ${e.message}`);
+            }
+          }
+
+          async function markFailed(item, error) {
+            try {
+              await firebasePatch(`${queuePath}/${item.id}`, {
+                status: "failed",
+                error: String(error).slice(0, 1000),
+                failedAt: Date.now()
+              });
+            } catch (e) {
+              console.error(`Could not mark ${item.id} failed: ${e.message}`);
+            }
+          }
+
+          // ===========================================================================
+          // Download + FTP upload
+          // ===========================================================================
+          async function downloadToFile(url, filePath, label) {
+            console.log(`Downloading ${label} from R2...`);
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`R2 download failed for ${label}: HTTP ${res.status}`);
+            fs.writeFileSync(filePath, Buffer.from(await res.arrayBuffer()));
+            console.log(`Saved ${filePath} (${fmtBytes(fs.statSync(filePath).size)})`);
+          }
+
+          function ftpUpload(localFile, remoteName) {
+            const target = `ftp://${FTP_HOST}/${remoteName}`;
+            const args = [
+              "--silent", "--show-error", "--fail",
+              "--ftp-pasv", "--connect-timeout", "30", "--max-time", "900",
+              "--retry", "2", "--retry-delay", "10",
+              "--user", `${FTP_USER}:${FTP_PASS}`,
+              "-T", localFile, target
+            ];
+            // Password is passed via argv only; never logged.
+            console.log(`FTP upload -> ${target}`);
+            execFileSync("curl", args, { stdio: ["ignore", "inherit", "inherit"], timeout: 15 * 60 * 1000 });
+            console.log(`FTP upload OK: ${remoteName}`);
+          }
+
+          // ===========================================================================
+          // CSV builder (Pond5 "Sound" column set, Clipid column intentionally omitted
+          // because OriginalFilename is our key and both keys cannot be used together)
+          // ===========================================================================
+          const CSV_COLUMNS = [
+            "OriginalFilename", "Copyright", "Price", "name", "City", "Region", "Country",
+            "Created", "ClipSource", "SpecifySource", "Keywords", "KeywordsCheckbox",
+            "SoundType", "Pro", "Publisher", "Composer", "PublicBin", "Description"
+          ];
+
+          function csvCell(v) {
+            const s = String(v ?? "");
+            return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+          }
+
+          function toMmDdYy(dateStr) {
+            // The Apply CSV form defaults to the mm/dd/yy date format, so emit that.
+            if (!dateStr) return "";
+            const m = String(dateStr).match(/^(\d{4})-(\d{2})-(\d{2})/);
+            if (!m) return String(dateStr);
+            return `${m[2]}/${m[3]}/${m[1].slice(2)}`;
+          }
+
+          function normalizeKeywords(kw) {
+            const list = (Array.isArray(kw) ? kw : String(kw || "").split(","))
+              .map(s => String(s).trim())
+              .filter(Boolean);
+            return [...new Set(list)].slice(0, 50).join(", ");
+          }
+
+          function buildCsv(items) {
+            const lines = [CSV_COLUMNS.join(",")];
+            for (const it of items) {
+              const row = {
+                OriginalFilename: it.remoteName,
+                Copyright: it.copyright,
+                Price: it.price,
+                name: String(it.title).slice(0, 80),
+                City: it.city,
+                Region: it.region,
+                Country: it.country,
+                Created: toMmDdYy(it.created),
+                ClipSource: DEF.clipSource,
+                SpecifySource: it.specifySource,
+                Keywords: normalizeKeywords(it.keywords),
+                KeywordsCheckbox: it.keywordsCheckbox,
+                SoundType: it.soundType,
+                Pro: "",
+                Publisher: it.publisher,
+                Composer: it.composer,
+                PublicBin: "",
+                Description: String(it.description).slice(0, 2000)
+              };
+              lines.push(CSV_COLUMNS.map(c => csvCell(row[c])).join(","));
+            }
+            return lines.join("\r\n") + "\r\n";
+          }
+
+          // ===========================================================================
+          // Pond5 browser actions
+          // ===========================================================================
+          async function pond5Login(page) {
+            console.log("Opening Pond5 login...");
+            await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
+
+            // The login fields live in a modal. On the dedicated login page they are
+            // usually present already; if not, click the "Log In" trigger first.
+            const emailBox = page.locator("#inputLoginModalLogin");
+            if (!(await emailBox.count())) {
+              const trigger = page.locator('a:has-text("Log In"), button:has-text("Log In")').first();
+              if (await trigger.count()) await trigger.click({ timeout: 15000 }).catch(() => {});
+            }
+            await emailBox.first().waitFor({ state: "visible", timeout: 60000 });
+            await emailBox.first().fill(USERNAME);
+            await page.locator("#inputLoginModalPassword").first().fill(PASSWORD);
+            await page.screenshot({ path: "p5-01-login.png" }).catch(() => {});
+
+            await Promise.all([
+              page.waitForLoadState("domcontentloaded").catch(() => {}),
+              page.locator('button:has-text("Log In"), input[type="submit"]').last().click({ timeout: 20000 })
+            ]);
+            await page.waitForTimeout(5000);
+            await page.screenshot({ path: "p5-02-after-login.png" }).catch(() => {});
+
+            const body = (await page.textContent("body").catch(() => "")) || "";
+            if (/incorrect|invalid (login|password)|try again/i.test(body) && /password/i.test(body)) {
+              throw new Error("Pond5 login appears to have failed (check username/password, or an email verification code may be required).");
+            }
+            console.log("Login step finished.");
+          }
+
+          // Finds the <select> that contains an option with the given label, sets it, and
+          // notifies both plain JS listeners and the Chosen plugin that wraps them.
+          async function selectByOptionLabel(page, label) {
+            const result = await page.evaluate((wanted) => {
+              const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
+              for (const sel of Array.from(document.querySelectorAll("select"))) {
+                const opt = Array.from(sel.options).find(o => norm(o.textContent) === norm(wanted));
+                if (!opt) continue;
+                sel.value = opt.value;
+                sel.dispatchEvent(new Event("change", { bubbles: true }));
+                if (window.jQuery) {
+                  try {
+                    window.jQuery(sel).trigger("chosen:updated");
+                    window.jQuery(sel).trigger("change");
+                  } catch (_) {}
+                }
+                return { field: sel.id || sel.name || "(unnamed select)", value: opt.value };
+              }
+              return null;
+            }, label);
+
+            if (!result) throw new Error(`Could not find a dropdown option named "${label}" on the Apply CSV page.`);
+            console.log(`Set ${result.field} = "${label}" (value: ${result.value})`);
+            return result;
+          }
+
+          async function applyCsv(page, csvPath, command, shot) {
+            console.log(`\n=== Apply CSV: command "${command}" ===`);
+            await page.goto(APPLY_CSV_URL, { waitUntil: "domcontentloaded" });
+            await page.waitForTimeout(2500);
+
+            await selectByOptionLabel(page, "That need be tagged");
+            await selectByOptionLabel(page, command);
+
+            const fileInput = page.locator('input[type="file"]').first();
+            await fileInput.waitFor({ state: "attached", timeout: 30000 });
+            await fileInput.setInputFiles(csvPath);
+            console.log(`Attached CSV: ${csvPath}`);
+
+            await page.locator('input[type="submit"], button[type="submit"], button:has-text("Submit")').first()
+              .click({ timeout: 30000 });
+            await page.waitForLoadState("domcontentloaded").catch(() => {});
+            await page.waitForTimeout(6000);
+
+            if (shot) await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+            const text = (await page.textContent("body").catch(() => "")) || "";
+            console.log("--- Apply CSV response (first 1500 chars) ---");
+            console.log(text.replace(/\s+/g, " ").slice(0, 1500));
+            return text;
+          }
+
+          // Uses the "Only list files found" command as a safe ingestion probe: Pond5 can
+          // take several minutes to register an FTP upload, and this reports it without
+          // writing anything.
+          async function waitForIngestion(page, csvPath, items) {
+            const deadline = Date.now() + INGEST_WAIT_MIN * 60 * 1000;
+            let attempt = 0;
+            let lastText = "";
+            while (Date.now() < deadline) {
+              attempt++;
+              lastText = await applyCsv(page, csvPath, "Only list files found", `p5-03-probe-${attempt}.png`);
+              const found = items.filter(it => lastText.includes(it.remoteName));
+              console.log(`Probe ${attempt}: ${found.length}/${items.length} file(s) visible on Pond5`);
+              if (found.length === items.length) return { ready: true, found, text: lastText };
+              if (Date.now() + 60000 >= deadline) {
+                return { ready: false, found, text: lastText };
+              }
+              console.log("Waiting 60s for Pond5 to finish ingesting the FTP upload...");
+              await page.waitForTimeout(60000);
+            }
+            return { ready: false, found: items.filter(it => lastText.includes(it.remoteName)), text: lastText };
+          }
+
+          // ===========================================================================
+          // MAIN
+          // ===========================================================================
+          (async () => {
+            const runStartedAt = Date.now();
+            let browser = null;
+            let items = [];
+            const uploaded = [];
+            const failed = [];
+
+            try {
+              items = await claimQueueItems(MAX_UPLOADS);
+
+              if (!items.length) {
+                console.log("Nothing to upload.");
+                await sendTelegram(tgCard(
+                  "ℹ️ <b>আজ কোনো আপলোড হয়নি</b>",
+                  [
+                    ["📁 প্রজেক্ট:", tgEscape(RUN_LABEL)],
+                    ["📝 কারণ:", "কিউতে আপলোড করার মতো কোনো ফাইল নেই।"],
+                    ["🕒 সময়:", fmtDhakaTime()]
+                  ],
+                  "💡 প্যানেল থেকে নতুন সাউন্ড ফাইল অ্যাড করুন।"
+                ));
+                return;
+              }
+
+              // ---- 1. R2 download + FTP upload --------------------------------------
+              for (const it of items) {
+                try {
+                  await downloadToFile(it.fileUrl, it.localFile, it.remoteName);
+                  ftpUpload(it.localFile, it.remoteName);
+                  uploaded.push(it);
+                } catch (e) {
+                  console.error(`FAILED ${it.remoteName}: ${e.message}`);
+                  failed.push({ item: it, error: e.message });
+                  await markFailed(it, e.message);
+                }
+              }
+
+              if (!uploaded.length) throw new Error("All FTP uploads failed - nothing to tag.");
+
+              // ---- 2. Build the metadata CSV ----------------------------------------
+              const csvPath = path.join(process.cwd(), "pond5-metadata.csv");
+              fs.writeFileSync(csvPath, buildCsv(uploaded), "utf8");
+              console.log(`\nCSV written: ${csvPath} (${fmtBytes(fs.statSync(csvPath).size)})`);
+              console.log(fs.readFileSync(csvPath, "utf8").slice(0, 2000));
+
+              // ---- 3. Log in and apply the CSV --------------------------------------
+              browser = await chromium.launch({ headless: HEADLESS, args: ["--no-sandbox"] });
+              const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+              const page = await ctx.newPage();
+              page.setDefaultTimeout(60000);
+
+              await pond5Login(page);
+
+              const probe = await waitForIngestion(page, csvPath, uploaded);
+              let applied = false;
+              let appliedText = "";
+
+              if (!probe.ready) {
+                console.warn(`Only ${probe.found.length}/${uploaded.length} file(s) showed up within ${INGEST_WAIT_MIN} min.`);
+              }
+
+              if (probe.found.length && !DRY_RUN) {
+                appliedText = await applyCsv(page, csvPath, "Apply CSV to clips", "p5-04-applied.png");
+                applied = true;
+              } else if (DRY_RUN) {
+                console.log("DRY RUN - stopping before 'Apply CSV to clips'.");
+              }
+
+              await page.goto(MY_UPLOADS_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+              await page.waitForTimeout(4000);
+              await page.screenshot({ path: "p5-05-my-uploads.png", fullPage: true }).catch(() => {});
+
+              // ---- 4. Clean up the queue for everything that was tagged ------------
+              if (applied) {
+                for (const it of probe.found) {
+                  try { await markDoneAndDelete(it); }
+                  catch (e) { console.error(`Cleanup failed for ${it.remoteName}: ${e.message}`); }
+                }
+                for (const it of uploaded.filter(u => !probe.found.includes(u))) {
+                  await markFailed(it, "Uploaded over FTP but Pond5 had not registered the file when the CSV was applied.");
+                }
+              }
+
+              // ---- 5. Report --------------------------------------------------------
+              const rows = [
+                ["📁 প্রজেক্ট:", tgEscape(RUN_LABEL)],
+                ["📤 FTP আপলোড:", `${uploaded.length}/${items.length}`],
+                ["🏷️ ট্যাগ বসেছে:", applied ? `${probe.found.length} টি` : (DRY_RUN ? "ড্রাই রান (কিছু বসানো হয়নি)" : "০ টি")],
+                ["⏱️ সময় লেগেছে:", fmtDuration(Date.now() - runStartedAt)],
+                ["🕒 সময়:", fmtDhakaTime()]
+              ];
+              if (failed.length) rows.push(["⚠️ ব্যর্থ:", `${failed.length} টি`]);
+
+              const fileLines = uploaded.map(it =>
+                `• <code>${tgEscape(it.remoteName)}</code>\n   ${tgEscape(String(it.title).slice(0, 70))}`
+              ).join("\n");
+
+              const footer = [
+                fileLines,
+                "",
+                applied
+                  ? "⏳ এখন আইটেমগুলো <b>Submit for Review</b> করতে হবে (My Uploads → আইটেম খুলে কমলা বাটন)।"
+                  : (DRY_RUN ? "🧪 ড্রাই রান শেষ — CSV ঠিক আছে কিনা স্ক্রিনশটে দেখুন।" : "⚠️ CSV apply হয়নি, লগ দেখুন।")
+              ].join("\n");
+
+              await sendTelegram(tgCard(
+                `🎧 <b>হ্যালো মঞ্জুরুল ভাই, ${greetBn()}!</b>\n<b>Pond5 আপলোড রিপোর্ট</b>`,
+                rows,
+                footer
+              ));
+
+              for (const shot of ["p5-04-applied.png", "p5-05-my-uploads.png"]) {
+                if (fs.existsSync(shot)) await sendTelegramPhoto(shot, `📸 ${shot}`);
+              }
+
+              console.log("\nDone.");
+            } catch (err) {
+              console.error(`FATAL: ${err.stack || err.message}`);
+              for (const it of items) {
+                if (!uploaded.includes(it) && !failed.find(f => f.item.id === it.id)) {
+                  await markFailed(it, err.message);
+                }
+              }
+              await sendTelegram(tgCard(
+                "❌ <b>Pond5 রান ব্যর্থ হয়েছে</b>",
+                [
+                  ["📁 প্রজেক্ট:", tgEscape(RUN_LABEL)],
+                  ["📝 কারণ:", `<code>${tgEscape(String(err.message).slice(0, 300))}</code>`],
+                  ["🕒 সময়:", fmtDhakaTime()]
+                ],
+                "💡 GitHub Actions লগ ও আর্টিফ্যাক্ট স্ক্রিনশট দেখুন।"
+              ));
+              process.exitCode = 1;
+            } finally {
+              if (browser) await browser.close().catch(() => {});
+            }
+          })();
+          POND5_BOT_EOF
+          node --check bot.js
+          echo "bot.js created ($(wc -l < bot.js) lines)"
+
+      - name: Run bot
+        env:
+          POND5_USERNAME: ${{ github.event.inputs.pond5_username }}
+          POND5_PASSWORD: ${{ github.event.inputs.pond5_password }}
+          POND5_FTP_USER: ${{ github.event.inputs.pond5_username }}
+          POND5_FTP_PASS: ${{ secrets.POND5_FTP_PASS }}
+          MAX_UPLOADS: ${{ github.event.inputs.max_uploads }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          HEADLESS: ${{ github.event.inputs.headless }}
+          DEFAULT_SOUND_TYPE: ${{ github.event.inputs.sound_type }}
+          DEFAULT_PRICE: ${{ github.event.inputs.price }}
+          INGEST_WAIT_MIN: "10"
+          QUEUE_PATH: "pond5Queue"
+          # Optional - create these two repository secrets to receive Telegram reports
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOLDER_NAME: "Pond5"
+        run: node bot.js
+
+      - name: Upload debug artifacts
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          path: category_state.json
-          key: category-state
-          
-      - name: Cleanup credentials
-        if: always()
-        run: rm -f service_account.json
+          name: pond5-debug
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            p5-*.png
+            pond5-metadata.csv
